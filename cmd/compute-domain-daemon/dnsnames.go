@@ -47,15 +47,18 @@ type DNSNameManager struct {
 	cliqueID              string
 	maxNodesPerIMEXDomain int
 	nodesConfigPath       string
+	dryRun                bool
+	hostsPath             string
 }
 
 // NewDNSNameManager creates a new DNS name manager.
-func NewDNSNameManager(cliqueID string, maxNodesPerIMEXDomain int, nodesConfigPath string) *DNSNameManager {
+func NewDNSNameManager(cliqueID string, maxNodesPerIMEXDomain int, nodesConfigPath string, dryRun bool) *DNSNameManager {
 	return &DNSNameManager{
 		ipToDNSName:           make(IPToDNSNameMap),
 		cliqueID:              cliqueID,
 		maxNodesPerIMEXDomain: maxNodesPerIMEXDomain,
 		nodesConfigPath:       nodesConfigPath,
+		dryRun:                dryRun,
 	}
 }
 
@@ -141,12 +144,44 @@ func (m *DNSNameManager) constructDNSName(daemon *nvapi.ComputeDomainDaemonInfo)
 	return dnsName, nil
 }
 
-// updateHostsFile updates the /etc/hosts file with current IP to DNS name mappings.
-func (m *DNSNameManager) updateHostsFile() error {
-	// Read hosts file
-	hostsContent, err := os.ReadFile(hostsFilePath)
+// resolveHostsPath returns the path to use for hosts file updates.
+// In dry-run mode or when /etc/hosts is not writable, it falls back to /tmp/hosts.
+func (m *DNSNameManager) resolveHostsPath() string {
+	if m.hostsPath != "" {
+		return m.hostsPath
+	}
+
+	if m.dryRun {
+		m.hostsPath = "/tmp/hosts"
+		klog.Infof("[dry-run] Using fallback hosts path: %s", m.hostsPath)
+		return m.hostsPath
+	}
+
+	// Check if /etc/hosts is writable
+	f, err := os.OpenFile(hostsFilePath, os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", hostsFilePath, err)
+		m.hostsPath = "/tmp/hosts"
+		klog.Warningf("/etc/hosts not writable, using fallback: %s", m.hostsPath)
+		return m.hostsPath
+	}
+	f.Close()
+
+	m.hostsPath = hostsFilePath
+	return m.hostsPath
+}
+
+// updateHostsFile updates the hosts file with current IP to DNS name mappings.
+func (m *DNSNameManager) updateHostsFile() error {
+	hostsPath := m.resolveHostsPath()
+
+	// Read hosts file (create empty if it doesn't exist in fallback mode)
+	hostsContent, err := os.ReadFile(hostsPath)
+	if err != nil {
+		if os.IsNotExist(err) && hostsPath != hostsFilePath {
+			hostsContent = []byte{}
+		} else {
+			return fmt.Errorf("failed to read %s: %w", hostsPath, err)
+		}
 	}
 
 	// Grab any lines to preserve, skipping existing DNS name mappings
@@ -180,8 +215,8 @@ func (m *DNSNameManager) updateHostsFile() error {
 	}
 
 	// Write the updated hosts file
-	if err := os.WriteFile(hostsFilePath, []byte(newHostsContent.String()), 0644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", hostsFilePath, err)
+	if err := os.WriteFile(hostsPath, []byte(newHostsContent.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", hostsPath, err)
 	}
 
 	return nil

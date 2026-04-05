@@ -62,6 +62,7 @@ type Flags struct {
 	podNamespace           string
 	maxNodesPerIMEXDomain  int
 	klogVerbosity          int
+	dryRun                 bool
 }
 
 type IMEXConfigTemplateData struct {
@@ -161,6 +162,12 @@ func newApp() *cli.App {
 			EnvVars:     []string{"MAX_NODES_PER_IMEX_DOMAIN"},
 			Destination: &flags.maxNodesPerIMEXDomain,
 		},
+		&cli.BoolFlag{
+			Name:        "dry-run",
+			Usage:       "Run without IMEX hardware dependencies (for performance testing)",
+			EnvVars:     []string{"DRY_RUN"},
+			Destination: &flags.dryRun,
+		},
 	}
 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
 	cliFlags = append(cliFlags, loggingConfig.Flags()...)
@@ -212,6 +219,10 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		return fmt.Errorf("CDI container edits did not apply -- is CDI enabled in your container runtime?")
 	}
 
+	if flags.dryRun {
+		klog.Infof("[dry-run] Running in dry-run mode without IMEX hardware dependencies")
+	}
+
 	common.StartDebugSignalHandlers()
 
 	// Validate feature gate dependencies
@@ -258,25 +269,38 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	}
 
 	// Render and write the IMEX daemon config with the current pod IP
-	if err := writeIMEXConfig(flags.podIP); err != nil {
-		return fmt.Errorf("writeIMEXConfig failed: %w", err)
+	if !flags.dryRun {
+		if err := writeIMEXConfig(flags.podIP); err != nil {
+			return fmt.Errorf("writeIMEXConfig failed: %w", err)
+		}
+	} else {
+		klog.Infof("[dry-run] Skipping writeIMEXConfig")
 	}
 
 	// Prepare IMEX daemon process manager (not invoking the process yet).
 	var dnsNameManager *DNSNameManager
 	if featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames) {
 		// Prepare DNS name manager
-		dnsNameManager = NewDNSNameManager(flags.cliqueID, flags.maxNodesPerIMEXDomain, imexDaemonNodesConfigPath)
+		dnsNameManager = NewDNSNameManager(flags.cliqueID, flags.maxNodesPerIMEXDomain, imexDaemonNodesConfigPath, flags.dryRun)
 
 		// Create static nodes config file with DNS names
-		if err := dnsNameManager.WriteNodesConfig(); err != nil {
-			return fmt.Errorf("failed to create static nodes config: %w", err)
+		if !flags.dryRun {
+			if err := dnsNameManager.WriteNodesConfig(); err != nil {
+				return fmt.Errorf("failed to create static nodes config: %w", err)
+			}
+		} else {
+			klog.Infof("[dry-run] Skipping DNSNameManager.WriteNodesConfig")
 		}
 	}
 
 	// Prepare IMEX daemon process manager.
-	daemonCommandLine := []string{imexDaemonBinaryName, "-c", imexDaemonConfigPath}
-	processManager := NewProcessManager(daemonCommandLine)
+	var processManager *ProcessManager
+	if !flags.dryRun {
+		daemonCommandLine := []string{imexDaemonBinaryName, "-c", imexDaemonConfigPath}
+		processManager = NewProcessManager(daemonCommandLine)
+	} else {
+		klog.Infof("[dry-run] Skipping ProcessManager creation")
+	}
 
 	// Prepare controller with CD manager (not invoking the controller yet).
 	controller, err := NewController(config)
@@ -302,7 +326,12 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames) {
+		if flags.dryRun {
+			if err := dryRunIMEXDaemonUpdateLoop(ctx, controller, dnsNameManager); err != nil {
+				klog.Errorf("[dry-run] IMEXDaemonUpdateLoop failed, initiate shutdown: %s", err)
+				cancel()
+			}
+		} else if featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames) {
 			// Use new DNS name-based functionality
 			if err := IMEXDaemonUpdateLoopWithDNSNames(ctx, controller, processManager, dnsNameManager); err != nil {
 				klog.Errorf("IMEXDaemonUpdateLoop failed, initiate shutdown: %s", err)
@@ -318,18 +347,22 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		klog.Infof("Terminated: IMEX daemon update task")
 	}()
 
-	// Start child process watchdog in goroutine.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// Watchdog restarts the IMEX daemon upon unexpected termination, and
-		// shuts it down gracefully upon our own shutdown.
-		if err := processManager.Watchdog(ctx); err != nil {
-			klog.Errorf("watch failed, initiate shutdown: %s", err)
-			cancel()
-		}
-		klog.Infof("Terminated: process manager")
-	}()
+	// Start child process watchdog in goroutine (skip in dry-run mode).
+	if !flags.dryRun {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Watchdog restarts the IMEX daemon upon unexpected termination, and
+			// shuts it down gracefully upon our own shutdown.
+			if err := processManager.Watchdog(ctx); err != nil {
+				klog.Errorf("watch failed, initiate shutdown: %s", err)
+				cancel()
+			}
+			klog.Infof("Terminated: process manager")
+		}()
+	} else {
+		klog.Infof("[dry-run] Skipping process manager watchdog")
+	}
 
 	wg.Wait()
 
@@ -422,9 +455,34 @@ func IMEXDaemonUpdateLoopWithDNSNames(ctx context.Context, controller *Controlle
 	}
 }
 
+// dryRunIMEXDaemonUpdateLoop handles daemon info updates in dry-run mode
+// without managing any real IMEX daemon process.
+func dryRunIMEXDaemonUpdateLoop(ctx context.Context, controller *Controller, dnsNameManager *DNSNameManager) error {
+	for {
+		select {
+		case <-ctx.Done():
+			klog.Infof("[dry-run] shutdown: stop dryRunIMEXDaemonUpdateLoop")
+			return nil
+		case daemons := <-controller.GetDaemonInfoUpdateChan():
+			klog.Infof("[dry-run] Received daemon info update: %d daemons", len(daemons))
+			if dnsNameManager != nil {
+				if _, err := dnsNameManager.UpdateDNSNameMappings(daemons); err != nil {
+					return fmt.Errorf("DNS mapping update failed: %w", err)
+				}
+				dnsNameManager.LogDNSNameMappings()
+			}
+		}
+	}
+}
+
 // check verifies if the node is IMEX capable and if so, checks if the IMEX daemon is ready.
 // It returns an error if any step fails.
 func check(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
+	if flags.dryRun {
+		fmt.Println("check succeeded (dry-run mode)")
+		return nil
+	}
+
 	if flags.cliqueID == "" {
 		fmt.Println("check succeeded (noop, clique ID is empty)")
 		return nil
