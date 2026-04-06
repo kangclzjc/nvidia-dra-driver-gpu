@@ -56,6 +56,10 @@ type ManagerConfig struct {
 	// logVerbosityCDDaemon controls the log verbosity for dynamically launched
 	// ComputeDomain daemons.
 	logVerbosityCDDaemon int
+
+	// dryRun disables DaemonSet creation and node label management.
+	// In this mode, daemon pods must be deployed manually.
+	dryRun bool
 }
 
 // Controller manages the lifecycle of the DRA driver and its components.
@@ -84,6 +88,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		clientsets:            c.config.clientsets,
 		workQueue:             workQueue,
 		logVerbosityCDDaemon:  c.config.flags.logVerbosityCDDaemon,
+		dryRun:          c.config.flags.dryRun,
 	}
 
 	// TODO: log full, nested cliFlags structure.

@@ -154,8 +154,12 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		return fmt.Errorf("error creating ResourceClaim manager: %w", err)
 	}
 
-	if err := m.nodeManager.Start(ctx); err != nil {
-		return fmt.Errorf("error starting Node manager: %w", err)
+	if !m.config.dryRun {
+		if err := m.nodeManager.Start(ctx); err != nil {
+			return fmt.Errorf("error starting Node manager: %w", err)
+		}
+	} else {
+		klog.Infof("[dry-run] Node manager disabled")
 	}
 
 	return nil
@@ -168,8 +172,10 @@ func (m *ComputeDomainManager) Stop() error {
 	if err := m.resourceClaimTemplateManager.Stop(); err != nil {
 		return fmt.Errorf("error stopping ResourceClaimTemplate manager: %w", err)
 	}
-	if err := m.nodeManager.Stop(); err != nil {
-		return fmt.Errorf("error stopping Node manager: %w", err)
+	if !m.config.dryRun {
+		if err := m.nodeManager.Stop(); err != nil {
+			return fmt.Errorf("error stopping Node manager: %w", err)
+		}
 	}
 	if m.cancelContext != nil {
 		m.cancelContext()
@@ -316,12 +322,14 @@ func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error
 			return fmt.Errorf("error deleting ResourceClaimTemplate: %w", err)
 		}
 
-		if err := m.daemonSetManager.Delete(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error deleting DaemonSet: %w", err)
-		}
+		if !m.config.dryRun {
+			if err := m.daemonSetManager.Delete(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error deleting DaemonSet: %w", err)
+			}
 
-		if err := m.nodeManager.RemoveComputeDomainLabels(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error removing ComputeDomain node labels: %w", err)
+			if err := m.nodeManager.RemoveComputeDomainLabels(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error removing ComputeDomain node labels: %w", err)
+			}
 		}
 
 		if err := m.resourceClaimTemplateManager.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
@@ -332,12 +340,14 @@ func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error
 			return fmt.Errorf("error asserting removal of ResourceClaimTemplate: %w", err)
 		}
 
-		if err := m.daemonSetManager.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error removing finalizer on DaemonSet: %w", err)
-		}
+		if !m.config.dryRun {
+			if err := m.daemonSetManager.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error removing finalizer on DaemonSet: %w", err)
+			}
 
-		if err := m.daemonSetManager.AssertRemoved(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
+			if err := m.daemonSetManager.AssertRemoved(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
+			}
 		}
 
 		if err := m.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
@@ -353,11 +363,15 @@ func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error
 	}
 
 	// Do not wait for the next periodic label cleanup to happen.
-	m.nodeManager.RemoveStaleComputeDomainLabelsAsync(ctx)
+	if !m.config.dryRun {
+		m.nodeManager.RemoveStaleComputeDomainLabelsAsync(ctx)
+	}
 
-	// Create the DaemonsetManager.
-	if _, err := m.daemonSetManager.Create(ctx, cd); err != nil {
-		return fmt.Errorf("error creating DaemonSet: %w", err)
+	// Create the DaemonSet (skip in dry-run).
+	if !m.config.dryRun {
+		if _, err := m.daemonSetManager.Create(ctx, cd); err != nil {
+			return fmt.Errorf("error creating DaemonSet: %w", err)
+		}
 	}
 
 	// Create the ResourceClaimTemplateManager.

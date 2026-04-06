@@ -68,6 +68,7 @@ type Flags struct {
 	imageName             string
 	maxNodesPerIMEXDomain int
 	logVerbosityCDDaemon  int
+	dryRun          bool
 
 	httpEndpoint string
 	metricsPath  string
@@ -117,6 +118,12 @@ func newApp() *cli.App {
 			Required:    true,
 			Destination: &flags.imageName,
 			EnvVars:     []string{"IMAGE_NAME"},
+		},
+		&cli.BoolFlag{
+			Name:        "dry-run",
+			Usage:       "Disable DaemonSet and node label management for dry-run testing. Daemon pods must be deployed manually.",
+			Destination: &flags.dryRun,
+			EnvVars:     []string{"DRY_RUN"},
 		},
 		&cli.IntFlag{
 			Name:        "log-verbosity-cd-daemon",
