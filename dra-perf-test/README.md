@@ -659,3 +659,42 @@ kind 的 2 节点架构天然缓解了冲突。推荐用 kind 做性能测试。
 | 推荐场景 | ✅ E2E 性能测试 | ✅ 快速验证 |
 
 **推荐：** 用 kind 做正式性能测试，用 k3s 做快速功能验证。
+
+---
+
+## Controller --dry-run 模式（推荐）
+
+手动部署 daemon pod 时，controller 的 DaemonSet manager 和 NodeManager 会产生冲突。
+
+`k8s-dra-driver` 的 `controller-dry-run` branch 加了 `--dry-run` flag：
+
+```bash
+compute-domain-controller --dry-run --image-name=... --max-nodes-per-imex-domain=18
+```
+
+跳过 DaemonSet 创建和 Node label 管理，保留 CDStatusSync / ResourceClaimTemplate / Clique manager / CD finalizer。
+
+代码改动：3 个文件，+44/-18 行。
+
+---
+
+## ⚠️ 必须开启 ComputeDomainCliques
+
+不开时 18 daemon + CDStatusSync 同时写一个 CD status → 409 Conflict 死循环。
+开启后每个 daemon 写自己的 Clique 对象，CDStatusSync 只读 → 无冲突。
+
+**编译时 ldflags 必须设 version ≥ v25.12.0：**
+```bash
+LDFLAGS="-X sigs.k8s.io/nvidia-dra-driver-gpu/internal/info.version=v25.12.0"
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS" -o /tmp/compute-domain-controller ./cmd/compute-domain-controller/
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS" -o /tmp/compute-domain-daemon ./cmd/compute-domain-daemon/
+```
+
+验证 controller 日志含 `"ComputeDomainCliques":true`。
+
+---
+
+## k3s 扩展限制
+
+flannel 给每个 fake node 分配子网 → >200 node 时 CIDR 耗尽 → panic。
+启动时加 `--cluster-cidr=10.42.0.0/12` 或用 kind 代替。
